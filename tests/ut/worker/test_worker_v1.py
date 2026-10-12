@@ -991,6 +991,30 @@ class TestNPUWorker(TestBase):
             self.assertEqual(worker.get_supported_pooling_tasks(), mock_pooling_tasks)
             self.assertEqual(worker.get_supported_tasks(), mock_supported_tasks)
 
+    @patch("vllm_ascend.model_loader.sharded_state.save_sharded_state")
+    def test_save_sharded_state(self, mock_save_model):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+            worker = NPUWorker()
+            worker.model_runner = MagicMock()
+            worker.vllm_config = MagicMock()
+            worker.vllm_config.quant_config = None
+
+            worker.save_sharded_state(
+                "/tmp/sharded",
+                pattern="rank-{rank}-{part}.safetensors",
+                max_size=4096,
+            )
+
+        mock_save_model.assert_called_once_with(
+            worker.model_runner.model,
+            "/tmp/sharded",
+            pattern="rank-{rank}-{part}.safetensors",
+            max_size=4096,
+            restore_unquantized_moe_layout=True,
+        )
+
     def test_execute_dummy_batch(self):
         """Test execute_dummy_batch method"""
         from vllm_ascend.worker.worker import NPUWorker

@@ -972,6 +972,22 @@ class NPUWorker(WorkerBase):
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 
+    def save_sharded_state(
+        self,
+        path: str,
+        pattern: str | None = None,
+        max_size: int | None = None,
+    ) -> None:
+        from vllm_ascend.model_loader.sharded_state import save_sharded_state
+
+        save_sharded_state(
+            self.model_runner.model,
+            path,
+            pattern=pattern,
+            max_size=max_size,
+            restore_unquantized_moe_layout=self.vllm_config.quant_config is None,
+        )
+
     @torch.inference_mode()
     def profile_prefill_latency(self, num_tokens: int) -> float:
         """
