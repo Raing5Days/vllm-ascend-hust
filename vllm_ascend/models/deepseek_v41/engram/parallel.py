@@ -16,11 +16,20 @@ from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v41.common.engram import (
     DEAD_ID,
 )
-from vllm.models.deepseek_v41.common.engram import (
-    engram_head_shard_rank as engram_head_shard_rank,
-)
 
 from vllm_ascend.utils import get_potential_max_tokens, is_pd_decode_recompute_scheduler_enabled
+
+try:
+    from vllm.models.deepseek_v41.nvidia.engram import (
+        engram_head_shard_rank as engram_head_shard_rank,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name not in ("vllm.models.deepseek_v41.nvidia", "vllm.models.deepseek_v41.nvidia.engram"):
+        raise
+    # Newer vLLM moved this helper to common and removed the NVIDIA module.
+    from vllm.models.deepseek_v41.common.engram import (
+        engram_head_shard_rank as engram_head_shard_rank,
+    )
 
 
 def resolve_dp_shared_memory(requested: bool) -> bool:

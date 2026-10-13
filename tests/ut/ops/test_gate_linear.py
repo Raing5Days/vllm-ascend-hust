@@ -24,6 +24,7 @@ import torch.nn.functional as F
 
 from tests.ut.base import TestBase
 from vllm_ascend.ops.fused_moe.gate_linear import AscendGateLinear
+from vllm_ascend.utils import vllm_version_is
 
 
 def _cpu_unquantized_apply(layer, x, bias=None):
@@ -184,6 +185,79 @@ class TestAscendGateLinear(TestBase):
         self.assertEqual(output.dtype, torch.bfloat16)
         self.assertEqual(output.shape, (2, 4))
         self.assertIsNone(output_bias)
+
+    def test_model_can_resolve_default_output_dtype_once(self):
+        gate = AscendGateLinear(16, 4, params_dtype=torch.bfloat16)
+        self.assertEqual(gate.out_dtype, torch.float32)
+        gate.set_out_dtype(torch.bfloat16)
+        hidden_states = torch.randn(2, 16, dtype=torch.bfloat16)
+        with (
+            patch("vllm_ascend.ops.fused_moe.gate_linear.torch.mm") as mm,
+            patch.object(gate.quant_method, "apply", side_effect=_cpu_unquantized_apply),
+        ):
+            output, _ = gate(hidden_states)
+        mm.assert_not_called()
+        self.assertEqual(output.dtype, torch.bfloat16)
+        with self.assertRaisesRegex(ValueError, "already been set"):
+            gate.set_out_dtype(torch.float32)
+        explicit_gate = AscendGateLinear(16, 4, out_dtype=torch.float32)
+        with self.assertRaisesRegex(ValueError, "already been set"):
+            explicit_gate.set_out_dtype(torch.bfloat16)
+
+    @unittest.skipIf(vllm_version_is("0.30.0"), "New GateLinear constructor API")
+    def test_tensor_only_return_for_fast_path_and_fallback(self):
+        hidden_states = torch.randn(2, 16, dtype=torch.bfloat16)
+        for params_dtype in (torch.bfloat16, torch.float32):
+            with self.subTest(params_dtype=params_dtype):
+                gate = AscendGateLinear(16, 4, params_dtype=params_dtype, return_bias=False)
+                with (
+                    patch("vllm_ascend.ops.fused_moe.gate_linear.torch.mm") as mm,
+                    patch.object(gate.quant_method, "apply", side_effect=_cpu_unquantized_apply),
+                ):
+                    mm.return_value = torch.randn(2, 4, dtype=torch.float32)
+                    output = gate(hidden_states)
+                self.assertIsInstance(output, torch.Tensor)
+                self.assertEqual(output.dtype, torch.float32)
+                self.assertEqual(mm.call_count, int(params_dtype == torch.bfloat16))
+
+    @unittest.skipIf(vllm_version_is("0.30.0"), "New GateLinear constructor API")
+    def test_bias_bypasses_fast_path_and_honors_skip_bias_add(self):
+        hidden_states = torch.randn(2, 16, dtype=torch.bfloat16)
+        for skip_bias_add in (False, True):
+            with self.subTest(skip_bias_add=skip_bias_add):
+                gate = AscendGateLinear(16, 4, bias=True, params_dtype=torch.bfloat16, skip_bias_add=skip_bias_add)
+                gate.weight.data.fill_(1)
+                gate.bias.data.fill_(2)
+                with (
+                    patch("vllm_ascend.ops.fused_moe.gate_linear.torch.mm") as mm,
+                    patch.object(gate.quant_method, "apply", side_effect=_cpu_unquantized_apply),
+                ):
+                    output, output_bias = gate(hidden_states)
+                mm.assert_not_called()
+                expected = F.linear(hidden_states, gate.weight, None if skip_bias_add else gate.bias)
+                torch.testing.assert_close(output, expected.float())
+                self.assertIs(output_bias, gate.bias if skip_bias_add else None)
+
+    @unittest.skipIf(vllm_version_is("0.30.0"), "New GateLinear constructor API")
+    def test_quantized_gate_without_plain_weight_uses_quant_method(self):
+        quant_method = mock.MagicMock()
+        quant_config = mock.MagicMock()
+        quant_config.get_quant_method.return_value = quant_method
+        hidden_states = torch.randn(2, 16, dtype=torch.bfloat16)
+        quant_method.apply.return_value = torch.randn(2, 4, dtype=torch.bfloat16)
+        for return_bias in (False, True):
+            with self.subTest(return_bias=return_bias):
+                gate = AscendGateLinear(16, 4, quant_config=quant_config, return_bias=return_bias)
+                self.assertFalse(hasattr(gate, "weight"))
+                self.assertFalse(gate.is_unquantized)
+                with patch("vllm_ascend.ops.fused_moe.gate_linear.torch.mm") as mm:
+                    result = gate(hidden_states)
+                mm.assert_not_called()
+                self.assertIs(quant_method.apply.call_args.args[1], hidden_states)
+                output = result[0] if return_bias else result
+                torch.testing.assert_close(output, quant_method.apply.return_value.float())
+                if return_bias:
+                    self.assertIsNone(result[1])
 
 
 if __name__ == "__main__":

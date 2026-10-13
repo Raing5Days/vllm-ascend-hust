@@ -1,5 +1,9 @@
 # Kimi-K2.5
 
+Upstream support for this model has been discontinued since vLLM Ascend v0.30.0 and will no longer receive support or fixes in subsequent versions. For deployment, please refer to the [historical version documentation](https://docs.vllm.ai/projects/ascend/en/v0.23.0/tutorials/models/Kimi-K2.5.html).
+
+The deployment instructions below are retained for fork users and historical reference; their original validation versions still apply.
+
 ## 1 Introduction
 
 Kimi K2.5 is an open-source, native multimodal agentic model built through continual pretraining on approximately 15 trillion mixed visual and text tokens atop Kimi-K2-Base. It seamlessly integrates vision and language understanding with advanced agentic capabilities, instant and thinking modes, as well as conversational and agentic paradigms.

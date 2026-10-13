@@ -24,6 +24,7 @@ except ImportError:
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel import sfa_cp
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadata, AscendSFADCPMetadataBuilder
+from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.dcp_utils import DCPManager
 from vllm_ascend.worker.v2 import attn_utils
 from vllm_ascend.worker.v2.spec_decode.dspark.speculator import AscendDSparkSpeculator
@@ -84,6 +85,8 @@ def _speculator(monkeypatch, kind, architecture, width, padded, step, use_dcp=Tr
     manager.vllm_config = config
     cls = AscendDSparkSpeculator if kind == "dspark" else AscendMTPSpeculator
     spec = object.__new__(cls)
+    spec.replicated_pcp = False
+    spec.enable_adaptive_verification = False
     if kind == "mtp":
         spec._sparse_kv_offload_metadata = SimpleNamespace(build_kwargs=lambda *args: None)
         spec.model_state = object()
@@ -131,6 +134,7 @@ def _speculator(monkeypatch, kind, architecture, width, padded, step, use_dcp=Tr
     spec.kv_cache_config = SimpleNamespace(kv_cache_groups=[None])
 
     class RecordingBuilder:
+        # vLLM main inspects this on the builder before building metadata.
         supports_update_block_table = False
 
         def build(self, common_prefix_len, common_attn_metadata):
@@ -197,7 +201,10 @@ def test_dspark_common_dcp_preparation(monkeypatch, architecture, padded, width,
         # field names/values apply (upstream now forwards is_prefilling).
         torch.testing.assert_close(common.seq_lens, device_lengths[:padded])
         assert _dcp_local_cpu(common) is None
-        assert common.is_prefilling.tolist() == [False] * padded
+        # v0.30.0 slices is_prefilling to the real request count; vLLM main
+        # slices to the padded request count.
+        expected_is_prefilling = [False, False] if vllm_version_is("0.30.0") else [False] * padded
+        assert common.is_prefilling.tolist() == expected_is_prefilling
     else:
         expected = [31 + width, 128] + [0] * (padded - 2)
         assert common.seq_lens_cpu.tolist() == expected

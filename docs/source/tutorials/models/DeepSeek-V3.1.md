@@ -1,5 +1,9 @@
 # DeepSeek-V3 & 3.1
 
+Upstream support for this model has been discontinued since vLLM Ascend v0.30.0 and will no longer receive support or fixes in subsequent versions. For deployment, please refer to the [historical version documentation](https://docs.vllm.ai/projects/ascend/en/v0.23.0/tutorials/models/DeepSeek-V3.1.html).
+
+The deployment instructions below are retained for fork users and historical reference; their original validation versions still apply.
+
 ## 1 Introduction
 
 DeepSeek-V3.1 is a hybrid model that supports both thinking mode and non-thinking mode. Compared to the previous version, this upgrade brings improvements in multiple aspects:
