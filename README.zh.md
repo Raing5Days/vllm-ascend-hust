@@ -84,7 +84,7 @@ PyTorch 2.13.0、TorchNPU 2.13.0rc1 与 Triton Ascend 3.6.0；不要混用稳定
 
 ## 访问昇腾NPU
 
-如果您需要访问昇腾NPU算力资源进行开发或测试，请进入华为HiDevLab平台的[HiDevLab-在线开发](https://hidevlab.huawei.com/online-develop-intro) 页面申请并使用算力。
+如果您需要访问昇腾NPU算力资源进行开发或测试，请进入HiDevLab平台的[HiDevLab-在线开发](https://hidevlab.huawei.com/online-develop-intro) 页面申请并使用算力。
 
 ## 开始使用
 
