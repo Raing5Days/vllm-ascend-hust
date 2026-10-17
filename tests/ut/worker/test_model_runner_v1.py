@@ -1377,6 +1377,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             self.assertEqual(layer.kv_cache, [caches[name]])
 
     def _check_load_model_prolog_budget(self, with_draft, pcp_enabled):
+        """Verify persistent PROLOG buffers are charged during weight loading."""
         runner = self._build_runner()
         runner.model_config.model = "test-model"
         runner.model_config.multimodal_config = None
@@ -1523,7 +1524,8 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         torch.nn.Module.__init__(attn_module)
         attn_module.impl = SimpleNamespace(
             fa_quant_layer=False,
-            supports_prolog_v3_writer=lambda: True,
+            supports_prolog_v3_writer=lambda: False,
+            supports_strided_mla_writer=lambda: True,
         )
         runner.compilation_config = SimpleNamespace(static_forward_context={layer_name: attn_module})
         runner.kernel_block_sizes = [128]
@@ -1659,7 +1661,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             dcp_enabled=False,
             pcp_enabled=False,
             is_pcp_decode_sharded=False,
-            supports_prolog_v3_writer=lambda: False,
+            supports_strided_mla_writer=lambda: False,
         )
         runner.compilation_config = SimpleNamespace(static_forward_context={layer_name: attn_module})
 
@@ -1693,7 +1695,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         attn_module.impl.is_pcp_decode_sharded = False
 
         attn_module.impl.dcp_enabled = True
-        attn_module.impl.supports_prolog_v3_writer = lambda: True
+        attn_module.impl.supports_strided_mla_writer = lambda: True
         runner.vllm_config.scheduler_config.max_num_batched_tokens = 16384
         attn_module.impl._dcp_current_kv_buffers_are_sufficient = lambda: False
         with patch(
@@ -1715,7 +1717,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             self.assertTrue(runner._uses_single_raw_mla_cache(layer_name, spec, attn_module))
         attn_module.impl._dcp_current_kv_buffers = None
         attn_module.impl.dcp_enabled = False
-        attn_module.impl.supports_prolog_v3_writer = lambda: True
+        attn_module.impl.supports_strided_mla_writer = lambda: True
         with patch(
             "vllm_ascend.worker.model_runner_v1.supports_component_major_mla_pd",
             return_value=True,
