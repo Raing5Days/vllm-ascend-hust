@@ -140,6 +140,7 @@ from vllm_ascend.attention.utils import (
     get_sfa_qsfa_packed_head_dim,
     get_tq_fused_slot_bytes,
     requires_contiguous_pa_kv_cache,
+    supports_strided_mla_cache,
     using_paged_attention,
 )
 
@@ -223,6 +224,7 @@ from vllm_ascend.utils import (
     model_uses_kpool_indexer,
     set_potential_max_tokens,
     should_skip_allreduce_across_dp_group,
+    vllm_version_is,
     weak_ref_tensor,
     weak_ref_tensors,
 )
@@ -4424,7 +4426,7 @@ class NPUModelRunner(GPUModelRunner):
         output = self.model.compute_logits(hidden_states)
         return output
 
-    def profile_run(self) -> None:
+    def profile_run(self, randomize_inputs: bool = False) -> None:
         self.eplb_warmup()
         if self.sparse_kv_offload_enabled:
             allocate_kv_offload_topk_profile_buffers(
@@ -4439,8 +4441,13 @@ class NPUModelRunner(GPUModelRunner):
         ) in {MoECommType.MC2, MoECommType.FUSED_MC2}:
             # Use a call-scoped bypass because skip_compiled would require runner-specific ForwardContext plumbing.
             with disable_compilation(self.get_model()):
-                self._dummy_run(mc2_tokens_capacity, with_prefill=True, is_profile=True)
-        super().profile_run()
+                self._dummy_run(
+                    mc2_tokens_capacity, with_prefill=True, is_profile=True, randomize_inputs=randomize_inputs
+                )
+        if vllm_version_is("0.31.0"):
+            super().profile_run(randomize_inputs=randomize_inputs)
+        else:
+            super().profile_run()
 
     def eplb_warmup(self):
         if self.dynamic_eplb and not self.is_eplb_warmuped:
@@ -4960,37 +4967,7 @@ class NPUModelRunner(GPUModelRunner):
             attn_module = self.compilation_config.static_forward_context.get(layer_name)
             if attn_module is None:
                 return False
-        if not isinstance(attn_module, MLAAttention):
-            return False
-        if getattr(attn_module, "indexer", None) is not None:
-            return False
-        impl = getattr(attn_module, "impl", None)
-        if getattr(impl, "pcp_enabled", False) or getattr(impl, "is_pcp_decode_sharded", False):
-            # PCP gathers and sharded-decode writes still use the legacy
-            # preprocessing contract. Keep their allocation compatible with it.
-            return False
-        if getattr(impl, "dcp_enabled", False):
-            buffers_are_sufficient = getattr(impl, "_dcp_current_kv_buffers_are_sufficient", None)
-            if buffers_are_sufficient is None or getattr(impl, "_dcp_current_kv_buffers", None) is None:
-                return False
-            if not buffers_are_sufficient():
-                # DCP split attention needs stable private current-KV buffers
-                # for every admitted decode, prefill, and mixed graph.
-                return False
-        if getattr(impl, "fa_quant_layer", False):
-            return False
-        if getattr(impl, "enable_kv_nz", False):
-            # NZ decode reshapes each component with .view(). A5 token-fused
-            # NoPE/RoPE slices are separated by the other component's lanes,
-            # so keep the legacy component-dense allocation for this mode.
-            return False
-        supports_prolog_writer = getattr(impl, "supports_prolog_v3_writer", None)
-        if supports_prolog_writer is None:
-            return False
-        # The strided writer needs MLAPrologV3, RoPE MLA, and a supported
-        # projection/quantization contract. Keep incompatible layers on the
-        # legacy writer layout instead of allocating a cache they cannot use.
-        return supports_prolog_writer()
+        return supports_strided_mla_cache(self.vllm_config, attn_module, kv_cache_spec)
 
     def _get_attention_kv_cache_dims(self, layer_name: str, kv_cache_spec: AttentionSpec) -> tuple[int, int]:
         if isinstance(kv_cache_spec, AscendMLAAttentionSpec):
@@ -6671,7 +6648,7 @@ class NPUModelRunner(GPUModelRunner):
             tensor_parallel_size = self.parallel_config.tensor_parallel_size
             if self._should_align_cudagraph_capture_sizes():
                 graph_alignment = math.lcm(self.uniform_decode_query_len, tensor_parallel_size)
-                self.compilation_config.adjust_cudagraph_sizes_for_spec_decode(graph_alignment)
+                self.compilation_config.adjust_cudagraph_sizes_for_spec_decode(graph_alignment, 1)
             cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
                 min_cg_support=min_cg_support,
                 min_cg_attn_backend=min_cg_attn_backend,

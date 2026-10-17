@@ -24,7 +24,6 @@ import torch.nn.functional as F
 
 from tests.ut.base import TestBase
 from vllm_ascend.ops.fused_moe.gate_linear import AscendGateLinear
-from vllm_ascend.utils import vllm_version_is
 
 
 def _cpu_unquantized_apply(layer, x, bias=None):
@@ -204,7 +203,6 @@ class TestAscendGateLinear(TestBase):
         with self.assertRaisesRegex(ValueError, "already been set"):
             explicit_gate.set_out_dtype(torch.bfloat16)
 
-    @unittest.skipIf(vllm_version_is("0.30.0"), "New GateLinear constructor API")
     def test_tensor_only_return_for_fast_path_and_fallback(self):
         hidden_states = torch.randn(2, 16, dtype=torch.bfloat16)
         for params_dtype in (torch.bfloat16, torch.float32):
@@ -220,7 +218,6 @@ class TestAscendGateLinear(TestBase):
                 self.assertEqual(output.dtype, torch.float32)
                 self.assertEqual(mm.call_count, int(params_dtype == torch.bfloat16))
 
-    @unittest.skipIf(vllm_version_is("0.30.0"), "New GateLinear constructor API")
     def test_bias_bypasses_fast_path_and_honors_skip_bias_add(self):
         hidden_states = torch.randn(2, 16, dtype=torch.bfloat16)
         for skip_bias_add in (False, True):
@@ -238,7 +235,6 @@ class TestAscendGateLinear(TestBase):
                 torch.testing.assert_close(output, expected.float())
                 self.assertIs(output_bias, gate.bias if skip_bias_add else None)
 
-    @unittest.skipIf(vllm_version_is("0.30.0"), "New GateLinear constructor API")
     def test_quantized_gate_without_plain_weight_uses_quant_method(self):
         quant_method = mock.MagicMock()
         quant_config = mock.MagicMock()
