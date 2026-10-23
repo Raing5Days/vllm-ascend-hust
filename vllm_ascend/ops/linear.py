@@ -20,6 +20,7 @@ AscendMergedColumnParallelLinear, AscendMergedColumnParallelLinear,
 AscendRowParallelLinear and AscendColumnParallelLinear.
 """
 
+import os
 import torch
 import torch.nn as nn
 from torch.nn.parameter import Parameter
@@ -90,6 +91,12 @@ class AscendUnquantizedLinearMethod(WeightSwitchMixin, UnquantizedLinearMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
+        if os.environ.get("VLLM_HUST_NZ_SKIP_GATE") == "1" and str(
+            getattr(layer, "prefix", "")
+        ).endswith(".shared_expert_gate"):
+            # NZ mode2 配置域 a2 例外: 标量门 [1,2048] 转 NZ 触发
+            # aclnnMatmulWeightNz EZ1001(n=1/k=1); 官方逐层豁免属性
+            layer.skip_weight_nz_conversion = True
         keep_nd_weight = _should_keep_nd_for_compatibility_weight(layer.weight.data)
         skip_weight_nz_conversion = getattr(layer, "skip_weight_nz_conversion", False)
         # must use fp32 to avoid accuracy degradation in dsv4.

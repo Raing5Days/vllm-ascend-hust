@@ -30,6 +30,10 @@ from setuptools.command.build_py import build_py
 from setuptools.command.develop import develop
 from setuptools.command.install import install
 
+# pip's build-isolation subprocess does not put this file's directory on
+# sys.path (unlike a plain `python setup.py` invocation), so the sibling
+# build_version.py module can't be found without this.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from build_version import resolve_trusted_scm_version
 
 

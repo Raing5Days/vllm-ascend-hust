@@ -15,6 +15,8 @@
 # limitations under the License.
 #
 
+import os
+
 import torch
 import torch_npu
 from einops import rearrange
@@ -39,12 +41,80 @@ from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
+from vllm.model_executor.layers.hpc import HpcModule
+
+# W3-F2 (2026-10-15): merge in_proj_ba into in_proj_qkvz -> one MatMulV2 per
+# GDN layer instead of two (flat qkvz layout only). Env-gated, default OFF.
+# v2: 合并在 process_weights_after_loading(HpcModule 协议, 权重加载后/dynamo 编译前)
+# 一次性完成并替换 weight —— v1 的 forward 内 lazy 实例缓存在 dynamo 下失效
+# (每步重 cat, 1015-175721 窗实测 ConcatD +2636ms 净回归)。
+_MERGE_GDN_INPROJ = os.environ.get("VLLM_HUST_GDN_MERGE_INPROJ", "0") == "1"
 
 
-class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+_PACKED_CONV_WEIGHT_NAME = "ascend_conv1d_weight_packed"
+_UNPACK_VIEWS_ENV = "VLLM_HUST_GDN_UNPACK_VIEWS"
+_UNPACK_VIEWS_ON = os.environ.get(_UNPACK_VIEWS_ENV) == "1"
+
+
+def _unpack_mixed_qkv_views(mixed, layer):
+    """ConcatD 消除: 行连续 mixed_qkv 的 q/k/v 直接切片视图（零拷贝）。"""
+    qd = layer.key_dim // layer.tp_size
+    vd = layer.value_dim // layer.tp_size
+    s = mixed.shape[0]
+    q = mixed[:, :qd].view(1, s, -1, layer.head_k_dim)
+    k = mixed[:, qd:2 * qd].view(1, s, -1, layer.head_k_dim)
+    v = mixed[:, 2 * qd:].view(1, s, -1, layer.head_v_dim)
+    return q, k, v
+_PACK_CONV_ENV = "VLLM_HUST_D4_CONV_PACK"
+
+
+def _pack_conv_weights(conv1d) -> bool:
+    """D4 site-2: materialise conv1d.weight [D,1,W] as contiguous [W,D] once."""
+    source = conv1d.weight
+    if source.is_meta:
+        return False
+    packed = (
+        source.view(source.size(0), source.size(2))
+        .transpose(0, 1)
+        .contiguous()
+    )
+    if _PACKED_CONV_WEIGHT_NAME in conv1d._parameters:
+        conv1d._parameters[_PACKED_CONV_WEIGHT_NAME].data = packed
+    else:
+        conv1d.register_parameter(
+            _PACKED_CONV_WEIGHT_NAME,
+            torch.nn.Parameter(packed, requires_grad=False),
+        )
+    return True
+
+
+class AscendGatedDeltaNetAttention(GatedDeltaNetAttention, HpcModule):
     # Cached fused-op availability probe result, shared across all layers so the
     # smoke call runs at most once per process.
     _fused_chunk_available: bool | None = None
+
+    def process_weights_after_loading(self, model):
+        """W3-F2 v2: 一次性把 in_proj_ba 并入 in_proj_qkvz.weight（[6176,2048]）。
+
+        由 model_loader 的 HpcModule 协议在权重加载后、dynamo 编译/图捕获前调用。
+        """
+        if os.environ.get(_PACK_CONV_ENV) == "1":
+            try:
+                _pack_conv_weights(self.conv1d)
+                print("[D4site2] packed conv weight [W,D] ready", flush=True)
+            except Exception as _e:  # noqa: BLE001
+                print(f"[D4site2] pack skipped: {_e!r}", flush=True)
+        print(f"[W3F2v2] hook: env={_MERGE_GDN_INPROJ} gqa={getattr(self, 'gqa_interleaved_layout', None)} "
+              f"has_qkv={hasattr(self, 'in_proj_qkv')} merged={getattr(self, '_w3f2_merged', False)}", flush=True)
+        if (not _MERGE_GDN_INPROJ) or getattr(self, "_w3f2_merged", False):
+            return
+        if hasattr(self, "in_proj_qkv") or self.gqa_interleaved_layout:
+            return
+        merged = torch.cat(
+            [self.in_proj_qkvz.weight.data, self.in_proj_ba.weight.data], dim=0
+        )
+        self.in_proj_qkvz.weight = torch.nn.Parameter(merged, requires_grad=False)
+        self._w3f2_merged = True
 
     @classmethod
     def _probe_fused_chunk(cls) -> bool:
@@ -200,17 +270,36 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             a = a.contiguous()
         else:
             if not self.gqa_interleaved_layout:
-                mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-                num_tokens = mixed_qkvz.size(0)
-                qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
-                z_size = self.value_dim // self.tp_size
-                mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
-                z = z.reshape(z.size(0), -1, self.head_v_dim)
-                ba, _ = self.in_proj_ba(hidden_states)
-                b, a = self._split_ba_for_tp(ba)
+                if _MERGE_GDN_INPROJ and getattr(self, "_w3f2_merged", False) and not hasattr(self, "in_proj_qkv"):
+                    # W3-F2 v2: in_proj_qkvz.weight 已含 ba 段（[6176,2048]），
+                    # 单次 matmul 后 slice；零 cat、零缓存写（dynamo 安全）。
+                    y = torch.nn.functional.linear(hidden_states, self.in_proj_qkvz.weight)
+                    qkvz_size = (self.key_dim * 2 + self.value_dim) // self.tp_size + (
+                        self.value_dim // self.tp_size
+                    )
+                    mixed_qkvz = y[:, :qkvz_size].contiguous()
+                    ba = y[:, qkvz_size:].contiguous()
+                    num_tokens = mixed_qkvz.size(0)
+                    qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+                    z_size = self.value_dim // self.tp_size
+                    mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
+                    z = z.reshape(z.size(0), -1, self.head_v_dim)
+                    b, a = self._split_ba_for_tp(ba)
 
-                b = b.contiguous()
-                a = a.contiguous()
+                    b = b.contiguous()
+                    a = a.contiguous()
+                else:
+                    mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+                    num_tokens = mixed_qkvz.size(0)
+                    qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+                    z_size = self.value_dim // self.tp_size
+                    mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
+                    z = z.reshape(z.size(0), -1, self.head_v_dim)
+                    ba, _ = self.in_proj_ba(hidden_states)
+                    b, a = self._split_ba_for_tp(ba)
+
+                    b = b.contiguous()
+                    a = a.contiguous()
             else:
                 projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
                 projected_states_ba, _ = self.in_proj_ba(hidden_states)
@@ -303,6 +392,12 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 1. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
+        _packed_conv_w = getattr(self.conv1d, _PACKED_CONV_WEIGHT_NAME, None)
+        conv_weights_T = (
+            _packed_conv_w
+            if _packed_conv_w is not None
+            else conv_weights.transpose(0, 1)
+        )
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 mixed_qkv_spec = mixed_qkv
@@ -316,7 +411,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            conv_weights_T = conv_weights.transpose(0, 1)
             activation_num = 1 if self.activation else 0
             spec_causal_conv1d_meta = attn_metadata.spec_decode_metadata.spec_causal_conv1d
             spec_query_start_loc_device = spec_causal_conv1d_meta.query_start_loc
@@ -345,7 +439,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 cache_indices_opt = non_spec_causal_conv1d_meta.cache_indices
                 initial_state_mode_opt = non_spec_causal_conv1d_meta.initial_state_mode
                 if get_pcp_group().world_size > 1:
-                    conv_weights_T = conv_weights.transpose(0, 1)
                     activation_num = 1 if self.activation else 0
                     non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
                     assert non_spec_query_start_loc is not None
@@ -388,7 +481,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                             -1, ...
                         ].transpose(-1, -2)
                 else:
-                    conv_weights_T = conv_weights.transpose(0, 1)
                     activation_num = 1 if self.activation else 0
                     mixed_qkv_non_spec_output = torch.empty_like(mixed_qkv_non_spec)
                     torch.ops._C_ascend.npu_causal_conv1d_custom(
@@ -407,11 +499,14 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     )
                     mixed_qkv_non_spec = mixed_qkv_non_spec_output
         elif attn_metadata.num_decodes > 0:
-            conv_weights_T = conv_weights.transpose(0, 1)
             activation_num = 1 if self.activation else 0
             non_spec_causal_conv1d_meta = attn_metadata.non_spec_decode_metadata.causal_conv1d
             non_spec_query_start_loc_device = non_spec_causal_conv1d_meta.query_start_loc
-            output_non_spec = torch.empty_like(mixed_qkv_non_spec)
+            output_non_spec = torch.empty(
+                mixed_qkv_non_spec.shape,
+                dtype=mixed_qkv_non_spec.dtype,
+                device=mixed_qkv_non_spec.device,
+            )
             torch.ops._C_ascend.npu_causal_conv1d_custom(
                 output_non_spec,
                 mixed_qkv_non_spec,
@@ -431,7 +526,16 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             mixed_qkv_non_spec = None
 
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
-        query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
+        if mixed_qkv_non_spec is None:
+            query_non_spec, key_non_spec, value_non_spec = None, None, None
+        elif (not _UNPACK_VIEWS_ON) or attn_metadata.num_prefills != 0:
+            query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
+        elif mixed_qkv_non_spec.is_contiguous():
+            query_non_spec, key_non_spec, value_non_spec = _unpack_mixed_qkv_views(
+                mixed_qkv_non_spec, self
+            )
+        else:
+            query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
 
         # 2. Recurrent attention
         g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)

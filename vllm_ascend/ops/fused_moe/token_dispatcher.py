@@ -20,7 +20,51 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+
+import triton
+import triton.language as tl
+
 from abc import ABC, abstractmethod
+
+
+_MOE_INIT_TRITON_ON = os.environ.get("VLLM_HUST_MOE_INIT_TRITON") == "1"
+
+
+@triton.jit
+def _moe_init_routing_t1_kernel(
+    x_ptr, ids_ptr,
+    sorted_ptr, rowidx_ptr, counts_ptr,
+    H: tl.constexpr, E: tl.constexpr, K: tl.constexpr,
+):
+    kidx = tl.arange(0, K)
+    ids = tl.load(ids_ptr + kidx).to(tl.int32)
+    xrow = tl.load(x_ptr + tl.arange(0, H)).to(x_ptr.dtype.element_ty)
+    sblock = tl.broadcast_to(xrow[None, :], (K, H))
+    tl.store(sorted_ptr + kidx[:, None] * H + tl.arange(0, H)[None, :], sblock)
+    iv = ids[:, None].to(tl.int32)
+    less = tl.sum((ids[None, :] < iv).to(tl.int32), axis=1)
+    sidx = kidx[None, :]
+    ties_before = tl.sum(((ids[None, :] == iv) & (sidx < kidx[:, None])).to(tl.int32), axis=1)
+    tl.store(rowidx_ptr + kidx, (less + ties_before).to(tl.int32))
+    counts = tl.zeros((E,), tl.int32)
+    for j in tl.static_range(K):
+        e_j = tl.sum(tl.where(kidx == j, ids, 0), axis=0)
+        counts += (tl.arange(0, E) == e_j.to(tl.int32)).to(tl.int32)
+    tl.store(counts_ptr + tl.arange(0, E), counts.to(counts_ptr.dtype.element_ty))
+
+
+def _moe_init_routing_t1(hidden_states, topk_ids, expert_num: int):
+    k = topk_ids.shape[1]
+    h = hidden_states.shape[1]
+    sorted_t = torch.empty((k, h), dtype=hidden_states.dtype, device=hidden_states.device)
+    rowidx = torch.empty((k,), dtype=torch.int32, device=hidden_states.device)
+    counts = torch.zeros((expert_num,), dtype=torch.int64, device=hidden_states.device)
+    _moe_init_routing_t1_kernel[(1,)](
+        hidden_states, topk_ids, sorted_t, rowidx, counts,
+        H=h, E=expert_num, K=k, num_warps=4,
+    )
+    return sorted_t, rowidx, counts, None
 from typing import Generic
 
 import torch
@@ -408,7 +452,11 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             first_expert_idx = 0
             last_expert_idx = self.num_experts_local
             global_num_experts = self.num_experts_local
-        sorted_hidden_states, expanded_row_idx, expert_tokens, dynamic_scale = DeviceOperator.npu_moe_init_routing(
+        if _MOE_INIT_TRITON_ON and hidden_states.shape[0] == 1 and hidden_states.is_contiguous():
+            sorted_hidden_states, expanded_row_idx, expert_tokens, dynamic_scale = _moe_init_routing_t1(
+                hidden_states, topk_ids, global_num_experts)
+        else:
+            sorted_hidden_states, expanded_row_idx, expert_tokens, dynamic_scale = DeviceOperator.npu_moe_init_routing(
             hidden_states,
             topk_ids,
             scale=dynamic_scale,
@@ -419,7 +467,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             active_expert_range=[first_expert_idx, last_expert_idx],
             quant_mode=quant_mode,
             act_quant_type=act_quant_type,
-        )
+            )
         expert_tokens = expert_tokens.to(torch.int64)
         group_list_type = 1  # `count` mode
 
