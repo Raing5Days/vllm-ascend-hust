@@ -3959,6 +3959,26 @@ class NPUModelRunner(GPUModelRunner):
                 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
                 DefaultModelLoader._init_ep_weight_filter = mock_pass
             self.model: nn.Module = get_model(vllm_config=self.vllm_config)
+            # W3-F2 (2026-10-16): 权重加载完成后、dynamo 编译/图捕获前，执行 GDN
+            # in_proj 一次性合并（env 门控）。放在 worker 显式调用是因为本栈 serve
+            # 走 netloader，其 load_model 不经过 vllm model_loader 的
+            # process_weights_after_loading（HpcModule 协议不触发）。
+            try:
+                import os as _os
+                if _os.environ.get("VLLM_HUST_GDN_MERGE_INPROJ", "0") == "1":
+                    # 实例是 vllm 核心 QwenGatedDeltaNetAttention（ascend 方法经
+                    # patch_qwen3_5 rebind 上去），判类须用核心类。
+                    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+                        QwenGatedDeltaNetAttention as _W3F2Cls,
+                    )
+                    _n = 0
+                    for _m in self.model.modules():
+                        if isinstance(_m, _W3F2Cls):
+                            _m.process_weights_after_loading(self.model)
+                            _n += 1
+                    logger.info("W3F2: GDN in_proj merge applied on %d layer(s)", _n)
+            except Exception as _e:  # noqa: BLE001
+                logger.warning("W3F2: GDN in_proj merge skipped: %s", _e)
             for name, _ in self.model.named_parameters():
                 # sinks is a kind of parameter in attention
                 # only set in weight name
