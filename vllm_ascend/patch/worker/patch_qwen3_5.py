@@ -198,7 +198,6 @@ if Qwen3_5MultiTokenPredictor is not None:
 
 Qwen3NextAttention.forward = AscendQwen3NextAttention.forward
 _GDN_PATCH_TARGET._split_ba_for_tp = AscendGatedDeltaNetAttention._split_ba_for_tp
-_GDN_PATCH_TARGET.process_weights_after_loading = AscendGatedDeltaNetAttention.process_weights_after_loading
 _GDN_PATCH_TARGET.get_state_shape = AscendGatedDeltaNetAttention.get_state_shape
 _GDN_PATCH_TARGET.get_attn_backend = AscendGatedDeltaNetAttention.get_attn_backend
 
